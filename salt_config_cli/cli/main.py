@@ -4049,7 +4049,11 @@ def exec_module(ctx, function, args, target, target_group, target_type, kwarg, p
             info_console.print(f"[dim]Job ID: {jid}[/dim]\n")
             
             completed, timed_out, cancelled = _wait_for_job(
-                api_client, jid, max_wait=wait, description="Waiting for minions to respond"
+                api_client,
+                jid,
+                max_wait=wait,
+                description="Waiting for minions to respond",
+                expected_minions=_expected_minion_count(resolved_target, resolved_target_type),
             )
             
             if completed:
@@ -4086,6 +4090,31 @@ def exec_module(ctx, function, args, target, target_group, target_type, kwarg, p
     api_client.close()
 
 
+def _expected_minion_count(target, target_type) -> int | None:
+    """Best-effort count of minions a resolved target spec addresses.
+
+    Returns ``None`` when the count can't be known ahead of time (glob,
+    compound, and grain matches depend on live minion membership the client
+    has no visibility into) -- callers must fall back to relying solely on
+    the server-side job status in that case.
+
+    ``list``-type targets are the one case where the CLI already knows
+    exactly how many minions were asked for (it either resolved a target
+    group's explicit member list, or the user passed ``--target`` with
+    ``--target-type list`` directly), so it's also the one case where "every
+    expected minion has reported a result" is a trustworthy completion
+    signal independent of RaaS's own job-status flag.
+    """
+    if target_type != "list":
+        return None
+    if isinstance(target, (list, tuple, set)):
+        return len(target) or None
+    if isinstance(target, str):
+        parts = [p for p in target.split(",") if p.strip()]
+        return len(parts) or None
+    return None
+
+
 def _wait_for_job(
     api_client,
     jid,
@@ -4093,6 +4122,7 @@ def _wait_for_job(
     max_wait: int = 600,
     description: str = "Waiting for job",
     live: bool = True,
+    expected_minions: int | None = None,
 ):
     """Poll a Salt job until it completes, times out, or the user cancels.
 
@@ -4107,11 +4137,23 @@ def _wait_for_job(
         description: spinner description (no trailing "...").
         live:       enable the live per-minion tracker (auto-disabled when
                     stdout is not a TTY).
+        expected_minions: if known (see ``_expected_minion_count``), the
+                    number of minions targeted. Once ``ret.get_returns``
+                    has a result for that many distinct minions, the job is
+                    treated as complete even if RaaS's own
+                    ``cmd.get_cmd_status`` never reports ``"complete"`` --
+                    which is exactly what happens for jids dispatched via a
+                    direct ``cmd.route_cmd`` ("local") call instead of one
+                    of RaaS's tracked Job entities: that status flag simply
+                    has no record of the jid and would otherwise leave this
+                    loop spinning until ``max_wait`` on every single run.
 
     Returns:
         (completed: bool, timed_out: bool, cancelled: bool)
     """
     import time
+
+    from salt_config_cli.api.exceptions import APIError
 
     use_live = bool(live) and sys.stdout.isatty() and not _truthy_env("SCC_NO_LIVE")
     poll_interval = 2
@@ -4128,9 +4170,11 @@ def _wait_for_job(
             max_wait=max_wait,
             description=description,
             poll_interval=poll_interval,
+            expected_minions=expected_minions,
         )
 
     # Plain spinner mode (CI/non-TTY/explicit opt-out)
+    seen_returns: set[str] = set()
     with Progress(
         SpinnerColumn(),
         TextColumn("[progress.description]{task.description}"),
@@ -4145,7 +4189,7 @@ def _wait_for_job(
                 waited += poll_interval
                 try:
                     status_resp = api_client.call("cmd", "get_cmd_status", jids=[jid])
-                except Exception as poll_err:
+                except APIError as poll_err:
                     progress.update(task, description=f"[yellow]Poll error: {poll_err}[/yellow]")
                     continue
                 if status_resp.success and status_resp.ret:
@@ -4156,14 +4200,38 @@ def _wait_for_job(
                     if status in ("failed", "error"):
                         progress.update(task, description="[red]Job failed[/red]")
                         break
-                    if unlimited:
-                        progress.update(task, description=f"{description}... ({waited}s, Ctrl+C to detach)")
-                    else:
-                        remaining = max(0, max_wait - waited)
-                        progress.update(
-                            task,
-                            description=f"{description}... ({waited}s / {max_wait}s, {remaining}s left)",
+                # Independent completion signal: if we know how many minions
+                # were targeted, check the master's own return cache directly
+                # rather than trusting the RaaS job-status flag alone (see
+                # docstring -- that flag never fires for direct-dispatch jids).
+                if expected_minions:
+                    try:
+                        returns_resp = api_client.call("ret", "get_returns", jid=jid)
+                    except APIError:
+                        returns_resp = None
+                    if returns_resp and returns_resp.success and returns_resp.ret:
+                        payload = returns_resp.ret
+                        results = (
+                            payload.get("results", [])
+                            if isinstance(payload, dict)
+                            else (payload if isinstance(payload, list) else [])
                         )
+                        for ret in results:
+                            if isinstance(ret, dict):
+                                mid = ret.get("minion_id") or ret.get("id")
+                                if mid:
+                                    seen_returns.add(mid)
+                        if len(seen_returns) >= expected_minions:
+                            completed = True
+                            break
+                if unlimited:
+                    progress.update(task, description=f"{description}... ({waited}s, Ctrl+C to detach)")
+                else:
+                    remaining = max(0, max_wait - waited)
+                    progress.update(
+                        task,
+                        description=f"{description}... ({waited}s / {max_wait}s, {remaining}s left)",
+                    )
         except KeyboardInterrupt:
             cancelled = True
 
@@ -4184,6 +4252,7 @@ def _wait_for_job_live(
     max_wait: int,
     description: str,
     poll_interval: int = 2,
+    expected_minions: int | None = None,
 ):
     """Live, in-place job tracker showing per-minion status.
 
@@ -4196,6 +4265,14 @@ def _wait_for_job_live(
         │  ...                                                                │
         ╰─────────────────────────────────────────────────────────────────────╯
 
+    ``expected_minions``, when known (see ``_expected_minion_count``), lets
+    this loop finish as soon as every targeted minion has reported a result
+    -- independent of RaaS's own ``cmd.get_cmd_status`` flag, which never
+    reports ``"complete"`` for jids dispatched via a direct
+    ``cmd.route_cmd``/state.apply call (as opposed to one of RaaS's tracked
+    Job entities). Without this, a job that finished on every minion in
+    seconds would otherwise sit here polling until ``max_wait``.
+
     Returns ``(completed, timed_out, cancelled)`` like ``_wait_for_job``.
     """
     import time
@@ -4206,6 +4283,7 @@ def _wait_for_job_live(
     from rich.text import Text
     from rich.console import Group
     from salt_config_cli.ui.theme import ICONS
+    from salt_config_cli.api.exceptions import APIError
 
     unlimited = max_wait <= 0
     waited = 0
@@ -4323,13 +4401,13 @@ def _wait_for_job_live(
                         )
                         if isinstance(s, str):
                             server_status = s
-                except Exception:
+                except APIError:
                     pass
 
                 # 2. Pull any returns that have come in so far
                 try:
                     returns_resp = api_client.call("ret", "get_returns", jid=jid)
-                except Exception:
+                except APIError:
                     returns_resp = None
 
                 if returns_resp and returns_resp.success and returns_resp.ret:
@@ -4363,6 +4441,21 @@ def _wait_for_job_live(
                     completed = True
                     break
                 if server_status in ("failed", "error"):
+                    break
+
+                # Independent completion signal: every minion we expected to
+                # hear from has reported a result, regardless of what RaaS's
+                # own job-status flag says. This is what actually fires for
+                # jids from a direct cmd.route_cmd dispatch (e.g. `scc run`/
+                # `scc deploy`) -- those never get a tracked Job entity, so
+                # `server_status` above sits on something like "not-found" or
+                # "queued" forever even after every minion is done.
+                if (
+                    expected_minions
+                    and len(minions) >= expected_minions
+                    and all(m["status"] in ("ok", "fail") for m in minions.values())
+                ):
+                    completed = True
                     break
         except KeyboardInterrupt:
             cancelled = True
@@ -5335,7 +5428,11 @@ def run_state(ctx, state_file, target, target_group, target_type, saltenv, test,
             completed = timed_out = cancelled = False
             for attempt in range(1, max_attempts + 1):
                 completed, timed_out, cancelled = _wait_for_job(
-                    api_client, jid, max_wait=wait, description="Applying state to minions"
+                    api_client,
+                    jid,
+                    max_wait=wait,
+                    description="Applying state to minions",
+                    expected_minions=_expected_minion_count(resolved_target, resolved_target_type),
                 )
 
                 if not completed:
@@ -7283,6 +7380,7 @@ def job_run(ctx, name, wait, no_wait, yes, as_json, output_file, pillar_file, co
     # passed alongside it and always runs the saved definition as-is
     # (verified against a live RaaS instance), so injecting ad-hoc pillar
     # data for a single run has to bypass the job_uuid shortcut entirely.
+    expected_minions = None
     try:
         if pillar_data is not None:
             stored_arg = (job_definition or {}).get("arg") or {}
@@ -7325,6 +7423,14 @@ def job_run(ctx, name, wait, no_wait, yes, as_json, output_file, pillar_file, co
                         resolved_target = master_tgt.get("tgt", "*")
                         resolved_target_type = master_tgt.get("tgt_type", "glob")
                         break
+
+            # This path dispatches via the same direct cmd.route_cmd
+            # ("local") mechanism as `scc run`/`scc deploy` -- not the
+            # job_uuid shortcut below -- so it hits the identical
+            # untracked-jid problem: cmd.get_cmd_status never reports
+            # "complete" for it. Compute the completion fallback the same
+            # way.
+            expected_minions = _expected_minion_count(resolved_target, resolved_target_type)
 
             console.print(f"[dim]Injecting pillar data from:[/dim] {pillar_file}\n")
 
@@ -7378,6 +7484,7 @@ def job_run(ctx, name, wait, no_wait, yes, as_json, output_file, pillar_file, co
             jid,
             max_wait=wait,
             description=f"Running '{job_name}'",
+            expected_minions=expected_minions,
         )
 
         if completed:
@@ -7505,7 +7612,7 @@ def job_status(ctx, jid, wait, timeout, as_json, config, server, username, passw
             
             if state in ("completed", "complete"):
                 console.print("[green]  ✓ Job completed[/green]\n")
-                
+
                 # Get full return data using ret.get_returns
                 returns_resp = api_client.call("ret", "get_returns", jid=jid)
                 if returns_resp.success and returns_resp.ret:
@@ -7520,8 +7627,38 @@ def job_status(ctx, jid, wait, timeout, as_json, config, server, username, passw
                 error_msg = status_data.get('error', '') if isinstance(status_data, dict) else ''
                 console.print(f"[red]  ✗ Job failed[/red]: {error_msg}\n")
                 break
-            elif not wait:
-                console.print(f"  [dim]Use --wait to wait for completion[/dim]\n")
+
+            # RaaS's job-status registry doesn't recognize this jid (most
+            # commonly "not-found") or reports an in-progress state we don't
+            # special-case above. That registry only tracks jids dispatched
+            # through one of RaaS's own Job entities (job-create/job-run's
+            # job_uuid shortcut); a jid from `scc run`/`scc deploy`/a direct
+            # `scc exec` (all of which use a raw cmd.route_cmd "local" call)
+            # was never registered there and will report a state like
+            # "not-found" forever, even after every minion has finished. The
+            # salt master's own return cache (ret.get_returns) is the ground
+            # truth for those -- check it directly rather than trusting the
+            # status flag alone.
+            returns_resp = api_client.call("ret", "get_returns", jid=jid)
+            if returns_resp.success and returns_resp.ret:
+                payload = returns_resp.ret
+                results = (
+                    payload.get("results", [])
+                    if isinstance(payload, dict)
+                    else (payload if isinstance(payload, list) else [])
+                )
+                if results:
+                    console.print(
+                        f"[green]  ✓ Results found via the minion return cache[/green] "
+                        f"(RaaS's job-status registry reports \"{state}\" for this jid -- "
+                        f"it wasn't created as a tracked Job, so that flag never updates; "
+                        f"the return cache is authoritative here)\n"
+                    )
+                    _display_job_returns(payload)
+                    break
+
+            if not wait:
+                console.print(f"  [dim]No results yet. Use --wait to keep polling.[/dim]\n")
                 break
         else:
             console.print(f"[red]✗[/red] Failed to get status: {status_resp.error}\n")
