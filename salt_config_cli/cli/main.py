@@ -4153,6 +4153,8 @@ def _wait_for_job(
     """
     import time
 
+    from salt_config_cli.api.exceptions import APIError
+
     use_live = bool(live) and sys.stdout.isatty() and not _truthy_env("SCC_NO_LIVE")
     poll_interval = 2
     waited = 0
@@ -4187,7 +4189,7 @@ def _wait_for_job(
                 waited += poll_interval
                 try:
                     status_resp = api_client.call("cmd", "get_cmd_status", jids=[jid])
-                except Exception as poll_err:
+                except APIError as poll_err:
                     progress.update(task, description=f"[yellow]Poll error: {poll_err}[/yellow]")
                     continue
                 if status_resp.success and status_resp.ret:
@@ -4205,7 +4207,7 @@ def _wait_for_job(
                 if expected_minions:
                     try:
                         returns_resp = api_client.call("ret", "get_returns", jid=jid)
-                    except Exception:
+                    except APIError:
                         returns_resp = None
                     if returns_resp and returns_resp.success and returns_resp.ret:
                         payload = returns_resp.ret
@@ -4281,6 +4283,7 @@ def _wait_for_job_live(
     from rich.text import Text
     from rich.console import Group
     from salt_config_cli.ui.theme import ICONS
+    from salt_config_cli.api.exceptions import APIError
 
     unlimited = max_wait <= 0
     waited = 0
@@ -4398,13 +4401,13 @@ def _wait_for_job_live(
                         )
                         if isinstance(s, str):
                             server_status = s
-                except Exception:
+                except APIError:
                     pass
 
                 # 2. Pull any returns that have come in so far
                 try:
                     returns_resp = api_client.call("ret", "get_returns", jid=jid)
-                except Exception:
+                except APIError:
                     returns_resp = None
 
                 if returns_resp and returns_resp.success and returns_resp.ret:
