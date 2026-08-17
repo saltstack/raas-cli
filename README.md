@@ -39,6 +39,7 @@ It provides a safe workflow for:
 18. [Automation and CI/CD](#automation-and-cicd)
 19. [Troubleshooting](#troubleshooting)
 20. [Development and release](#development-and-release)
+21. [Docker](#docker)
 
 ---
 
@@ -1383,6 +1384,83 @@ SECURITY.md
 CONTRIBUTING.md
 CHANGELOG.md
 ```
+
+---
+
+## Docker
+
+A sample containerized deployment lives under `docker/`. It builds an image that:
+
+- builds the `salt-config-cli` wheel from this repo and installs it (`scc`/`salt-config`/`raas` entry points);
+- installs the system `git` client that SCC shells out to for repo operations;
+- runs a small FastAPI server (`docker/api/app.py`) with a single `POST /commands` endpoint that executes `scc` commands and returns the result.
+
+```text
+docker/
+├── Dockerfile
+└── api/
+    ├── app.py
+    └── requirements.txt
+```
+
+### Build
+
+Build from the **repo root** (the Dockerfile copies `pyproject.toml`, `README.md`, `LICENSE`, and `salt_config_cli/` from the build context):
+
+```bash
+docker build \
+  -f docker/Dockerfile \
+  -t salt-cli-api:latest \
+  .
+```
+
+Corporate networks that block direct PyPI access can point `pip` at an internal mirror via the `PIP_INDEX_URL` build arg (defaults to Broadcom's internal Artifactory):
+
+```bash
+docker build \
+  -f docker/Dockerfile \
+  --build-arg PIP_INDEX_URL=https://packages.vcfd.broadcom.net/artifactory/api/pypi/pypi-virtual/simple \
+  -t salt-cli-api:latest \
+  .
+```
+
+### Run
+
+```bash
+docker run --rm -p 8000:8000 salt-cli-api:latest
+```
+
+### Use
+
+Health check:
+
+```bash
+curl http://localhost:8000/healthz
+# {"status":"ok"}
+```
+
+Trigger an `scc` command (the `scc`/`salt-config`/`raas` prefix in `command` is optional):
+
+```bash
+curl -X POST http://localhost:8000/commands \
+  -H 'Content-Type: application/json' \
+  -d '{"command": "repo list --json"}'
+```
+
+Response shape:
+
+```json
+{
+  "command": "scc repo list --json",
+  "returncode": 0,
+  "stdout": "...",
+  "stderr": ""
+}
+```
+
+An optional `timeout` field (seconds, default `60`, max `600`) bounds how long the server waits for the command before returning `504`.
+
+> This API executes `scc` with arguments taken directly from the request body and returns raw stdout/stderr — it is a development/demo convenience, not a hardened production service. Do not expose it on an untrusted network without adding authentication and access controls.
 
 ---
 
