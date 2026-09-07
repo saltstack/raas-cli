@@ -9,7 +9,7 @@ This module handles:
 """
 
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Dict, List, Optional, Union
 from pydantic import BaseModel, Field
@@ -64,7 +64,7 @@ class ResourceDrift(BaseModel):
     attribute_drifts: List[AttributeDrift] = Field(default_factory=list)
     
     # Metadata
-    detected_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+    detected_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     message: Optional[str] = None
     job_id: Optional[str] = None
     
@@ -104,7 +104,7 @@ class DriftReport(BaseModel):
     
     # Report metadata
     report_id: str = ""
-    generated_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+    generated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     server_url: Optional[str] = None
     
     # Results
@@ -193,7 +193,7 @@ class RemediationPlan(BaseModel):
     """Plan for remediating detected drift."""
     
     plan_id: str = ""
-    created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     
     # Source drift report
     drift_report: Optional[DriftReport] = None

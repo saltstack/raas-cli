@@ -9,7 +9,7 @@ description = "Safe Git-to-RaaS workflows and interactive Salt configuration ope
 readme = "README.md"
 license = "Apache-2.0"
 license-files = ["LICENSE"]
-requires-python = ">=3.10"
+requires-python = ">=3.9"
 authors = [{name = "Salt Config CLI contributors"}]
 maintainers = [{name = "Salt Config CLI contributors"}]
 keywords = ["salt", "saltstack", "raas", "tanzu-salt", "aria-automation-config", "configuration-management", "cli"]
@@ -20,6 +20,7 @@ classifiers = [
   "Intended Audience :: System Administrators",
   "Operating System :: OS Independent",
   "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.9",
   "Programming Language :: Python :: 3.10",
   "Programming Language :: Python :: 3.11",
   "Programming Language :: Python :: 3.12",

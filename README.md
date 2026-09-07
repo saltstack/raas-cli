@@ -389,6 +389,54 @@ profiles:
 
 Passwords and tokens should be stored through the OS keychain, secure environment variables, stdin, a protected file, or a masked prompt. They should not be stored in profile YAML.
 
+### Authentication modes
+
+Each profile picks one authentication mode via `auth`:
+
+| `auth` value | Credential | How it reaches RaaS |
+| --- | --- | --- |
+| `password` (default) | RaaS username/password | Exchanged for a JWT via RaaS's own `/account/login`, sent as `Authorization: JWT <token>`. |
+| `csp-token` | VMware CSP API token | Exchanged for a CSP access token, sent as `csp-auth-token`. |
+| `api-token` | API token + auth server URL | Exchanged for a Bearer access token via `POST <auth_server_url>/acs/t/CUSTOMER/token`, sent as `Authorization: Bearer <token>`. |
+
+`api-token` is for environments that hand out short-lived access tokens through a VCF-style auth server instead of RaaS's own login or CSP, e.g.:
+
+```bash
+curl --request POST \
+  --url https://10.162.218.0:9002/acs/t/CUSTOMER/token \
+  --header 'Content-Type: application/x-www-form-urlencoded' \
+  --data api_token=<token> \
+  --data grant_type=urn:custom:vcf:params:oauth:grant-type:api-token
+```
+
+Configure it with:
+
+```bash
+scc configure --name lab \
+  --auth api-token \
+  --server https://raas-lab.example.com \
+  --auth-server-url https://10.162.218.0:9002
+
+scc profile login lab   # stores the API token in the OS keychain
+scc profile test lab
+```
+
+The resulting profile looks like:
+
+```yaml
+profiles:
+  lab:
+    server_url: https://raas-lab.example.com
+    auth: api-token
+    auth_server_url: https://10.162.218.0:9002
+```
+
+The tenant path segment (`CUSTOMER`) is fixed and not configurable.
+
+The API token itself is never written to YAML — store it via `scc profile login`, or set `SCC_API_TOKEN` for a single process (`SCC_AUTH_SERVER_URL` overrides the profile's auth server URL the same way). All commands that read a profile (`scc status`, `scc deploy`, ...) resolve the token automatically once it's configured — see `scc config env` for the full variable list.
+
+`scc connect`, the one-shot onboarding wizard, supports it too: run it bare and it asks `Authentication method (basic, token) [basic]` before anything else — answering `basic` continues the existing username/password flow, and `token` asks for the auth server URL and API token instead of a username/password. Passing `--api-token`/`--auth-server-url` (or setting `SCC_API_TOKEN`/`SCC_AUTH_SERVER_URL`) skips the prompt non-interactively, the same way `--csp-token` already does for CSP auth.
+
 ---
 
 ## Git repository model
@@ -1393,11 +1441,13 @@ A sample containerized deployment lives under `docker/`. It builds an image that
 
 - builds the `salt-config-cli` wheel from this repo and installs it (`scc`/`salt-config`/`raas` entry points);
 - installs the system `git` client that SCC shells out to for repo operations;
+- on container startup, optionally connects to RaaS and registers the `customer-values` data repo (see [Startup configuration](#startup-configuration) below);
 - runs a small FastAPI server (`docker/api/app.py`) with a single `POST /commands` endpoint that executes `scc` commands and returns the result.
 
 ```text
 docker/
 ├── Dockerfile
+├── entrypoint.sh
 └── api/
     ├── app.py
     └── requirements.txt
@@ -1429,6 +1479,47 @@ docker build \
 ```bash
 docker run --rm -p 8000:8000 salt-cli-api:latest
 ```
+
+### Startup configuration
+
+`docker/entrypoint.sh` runs automatically before the API server starts. If `SCC_SERVER_URL` and either `SCC_USERNAME`/`SCC_PASSWORD` or `SCC_CSP_API_TOKEN` are set, it performs the same setup as the [five-minute quick start](#five-minute-quick-start):
+
+```bash
+scc connect --name "$SCC_PROFILE_NAME" --server "$SCC_SERVER_URL" --username "$SCC_USERNAME" --password-stdin
+scc profile use "$SCC_PROFILE_NAME"
+scc profile test "$SCC_PROFILE_NAME" --no-prompt
+
+scc repo add customer-values \
+  --kind data \
+  --url "$CUSTOMER_VALUES_REPO_URL" \
+  --ref main \
+  --root . \
+  --layout '{environment}/{version}/{resource}/values.yaml' \
+  --auth token \
+  --default
+```
+
+| Variable                        | Required                    | Description                                                                                    |
+| -------------------------------- | ---------------------------- | ------------------------------------------------------------------------------------------------ |
+| `SCC_SERVER_URL`                | yes (to enable setup)        | RaaS server URL.                                                                                  |
+| `SCC_USERNAME`                  | with `SCC_PASSWORD`          | RaaS username.                                                                                     |
+| `SCC_PASSWORD`                  | with `SCC_USERNAME`          | RaaS password, piped to `scc connect --password-stdin`.                                           |
+| `SCC_CSP_API_TOKEN`             | alternative to user/pass     | CSP API token; used instead of username/password if set.                                          |
+| `SCC_PROFILE_NAME`              | no (default `default`)       | Name of the connection profile to create/use.                                                     |
+| `CUSTOMER_VALUES_REPO_URL`      | no (registers repo if set)   | Git URL for the private customer-values repository.                                               |
+| `SCC_GIT_TOKEN_CUSTOMER_VALUES` | for `--auth token` fetches   | Git token for the `customer-values` source; resolved by `scc` at fetch time (see [Git source management](#git-repository-model)), not passed to `repo add`. |
+
+```bash
+docker run --rm -p 8000:8000 \
+  -e SCC_SERVER_URL=https://raas.example.com \
+  -e SCC_USERNAME=admin \
+  -e SCC_PASSWORD=secret \
+  -e CUSTOMER_VALUES_REPO_URL=ssh://git@git.example.com/customer/config-values.git \
+  -e SCC_GIT_TOKEN_CUSTOMER_VALUES=ghp_xxx \
+  salt-cli-api:latest
+```
+
+The `customer-values` repo registration only runs when `CUSTOMER_VALUES_REPO_URL` is set, and (like `scc profile use`/`scc profile test`) does not depend on the RaaS connection succeeding — a failed `scc connect` doesn't block it, and the container still starts the API server either way. Omit all the env vars to skip startup configuration entirely and boot straight into the API server, e.g. for local testing without a RaaS environment.
 
 ### Use
 

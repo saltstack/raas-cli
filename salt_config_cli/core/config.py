@@ -64,7 +64,7 @@ class ConnectionProfile(BaseModel):
 
     server_url: str
     username: Optional[str] = None
-    auth: Literal["password", "csp-token"] = "password"
+    auth: Literal["password", "csp-token", "api-token"] = "password"
     config_name: str = "internal"
     ssl_verify: bool = True
     ca_bundle: Optional[str] = None
@@ -78,6 +78,7 @@ class ConnectionProfile(BaseModel):
     default_target_type: str = "glob"
     csp_url: str = "https://console.cloud.vmware.com"
     csp_org_id: Optional[str] = None
+    auth_server_url: Optional[str] = None
     ops_server_url: Optional[str] = None
     ops_username: Optional[str] = None
     ops_ssl_verify: bool = False
@@ -120,6 +121,19 @@ class ConnectionProfile(BaseModel):
         parsed = urlparse(normalized)
         if parsed.scheme not in {"http", "https"} or not parsed.netloc:
             raise ValueError("ops_server_url must be an absolute HTTP(S) URL")
+        return normalized
+
+    @field_validator("auth_server_url")
+    @classmethod
+    def validate_auth_server_url(cls, value: Optional[str]) -> Optional[str]:
+        if value is None or not value.strip():
+            return None
+        normalized = value.strip().rstrip("/")
+        if not normalized.startswith(("http://", "https://")):
+            normalized = f"https://{normalized}"
+        parsed = urlparse(normalized)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            raise ValueError("auth_server_url must be an absolute HTTP(S) URL")
         return normalized
 
     @field_validator("rpc_paths")
@@ -187,13 +201,17 @@ class SaltConfigSettings(BaseSettings):
     server_url: str = Field(default="https://localhost")
     username: Optional[str] = None
     password: Optional[SecretStr] = None
-    auth: Literal["password", "csp-token"] = "password"
+    auth: Literal["password", "csp-token", "api-token"] = "password"
     config_name: str = "internal"
 
     # CSP
     csp_url: str = "https://console.cloud.vmware.com"
     csp_org_id: Optional[str] = None
     csp_api_token: Optional[SecretStr] = None
+
+    # API token exchange (POST {auth_server_url}/acs/t/<fixed tenant>/token)
+    auth_server_url: Optional[str] = None
+    api_token: Optional[SecretStr] = None
 
     # VCF Operations connection
     ops_server_url: Optional[str] = None
@@ -296,6 +314,7 @@ class SaltConfigSettings(BaseSettings):
             # Never load plaintext secrets from YAML.
             raw.pop("password", None)
             raw.pop("csp_api_token", None)
+            raw.pop("api_token", None)
 
             if "profiles" in raw:
                 # Normalize hybrid v0.6 documents before selecting a profile.
@@ -344,6 +363,7 @@ class SaltConfigSettings(BaseSettings):
             "SCC_SERVER_URL": ("server_url", str),
             "SCC_USERNAME": ("username", str),
             "SCC_CONFIG_NAME": ("config_name", str),
+            "SCC_AUTH_SERVER_URL": ("auth_server_url", str),
             "SCC_SSL_VERIFY": ("ssl_verify", boolean),
             "SCC_CA_BUNDLE": ("ca_bundle", str),
             "SCC_SSL_CERT": ("ssl_cert", str),
@@ -385,6 +405,7 @@ class SaltConfigSettings(BaseSettings):
             default_target_type=self.default_target_type,
             csp_url=self.csp_url,
             csp_org_id=self.csp_org_id,
+            auth_server_url=self.auth_server_url,
             ops_server_url=self.ops_server_url,
             ops_username=self.ops_username,
             ops_ssl_verify=self.ops_ssl_verify,
@@ -401,6 +422,8 @@ class SaltConfigSettings(BaseSettings):
                 data["password"] = "***"
             if data.get("csp_api_token"):
                 data["csp_api_token"] = "***"
+            if data.get("api_token"):
+                data["api_token"] = "***"
             if data.get("ops_password"):
                 data["ops_password"] = "***"
         data["profile_name"] = self.profile_name
@@ -430,6 +453,9 @@ class SaltConfigSettings(BaseSettings):
             config["csp_api_token"] = self.csp_api_token.get_secret_value()
             if self.csp_org_id:
                 config["csp_org_id"] = self.csp_org_id
+        if self.api_token and self.auth_server_url:
+            config["auth_server_url"] = self.auth_server_url
+            config["api_token"] = self.api_token.get_secret_value()
         return config
 
     def get_ops_auth_config(self) -> Optional[Dict[str, Any]]:

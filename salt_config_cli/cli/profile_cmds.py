@@ -65,6 +65,7 @@ PROFILE_FIELDS = {
     "default_target_type",
     "csp_url",
     "csp_org_id",
+    "auth_server_url",
     "ops_server_url",
     "ops_username",
     "ops_ssl_verify",
@@ -73,7 +74,7 @@ PROFILE_FIELDS = {
     "theme",
     "log_level",
 }
-OPTIONAL_FIELDS = {"username", "ca_bundle", "ssl_cert", "ssl_key", "csp_org_id"}
+OPTIONAL_FIELDS = {"username", "ca_bundle", "ssl_cert", "ssl_key", "csp_org_id", "auth_server_url"}
 BOOL_FIELDS = {"ssl_verify", "ops_ssl_verify", "color"}
 INT_FIELDS = {"timeout", "token_ttl"}
 LIST_FIELDS = {"rpc_paths"}
@@ -102,11 +103,18 @@ def _fail(ctx: click.Context, message: str, hint: Optional[str] = None, code: in
 
 
 def _credential_identity(profile: ConnectionProfile) -> str:
-    return profile.username or "__csp__"
+    if profile.username:
+        return profile.username
+    return "__api_token__" if profile.auth == "api-token" else "__csp__"
 
 
 def _credential_status(name: str, profile: ConnectionProfile) -> tuple[str, str]:
-    env_name = "SCC_CSP_API_TOKEN" if profile.auth == "csp-token" else "SCC_PASSWORD"
+    if profile.auth == "csp-token":
+        env_name = "SCC_CSP_API_TOKEN"
+    elif profile.auth == "api-token":
+        env_name = "SCC_API_TOKEN"
+    else:
+        env_name = "SCC_PASSWORD"
     if os.getenv(env_name):
         return f"environment:{env_name}", "success"
     if keychain_get(profile.server_url, _credential_identity(profile)):
@@ -122,6 +130,11 @@ def _load_runtime_settings(ctx: click.Context, name: Optional[str] = None) -> Sa
         if token:
             settings.csp_api_token = SecretStr(token)
             object.__setattr__(settings, "_password_source", "environment" if os.getenv("SCC_CSP_API_TOKEN") else "keychain")
+    elif settings.auth == "api-token":
+        token = os.getenv("SCC_API_TOKEN") or keychain_get(settings.server_url, settings.username or "__api_token__")
+        if token:
+            settings.api_token = SecretStr(token)
+            object.__setattr__(settings, "_password_source", "environment" if os.getenv("SCC_API_TOKEN") else "keychain")
     else:
         password = os.getenv("SCC_PASSWORD") or keychain_get(settings.server_url, settings.username)
         if password:
@@ -139,6 +152,15 @@ def _test_profile(ctx: click.Context, name: str, *, prompt: bool = True) -> tupl
                 settings.csp_api_token = SecretStr(token)
         if not settings.csp_api_token:
             raise ValueError("No CSP API token is available; run `scc profile login` or set SCC_CSP_API_TOKEN")
+    if settings.auth == "api-token":
+        if not settings.api_token and prompt and sys.stdin.isatty():
+            token = prompt_password(f"API token for profile '{name}'")
+            if token:
+                settings.api_token = SecretStr(token)
+        if not settings.api_token:
+            raise ValueError("No API token is available; run `scc profile login` or set SCC_API_TOKEN")
+        if not settings.auth_server_url:
+            raise ValueError("Profile is configured for api-token auth but has no auth_server_url; run `scc configure --auth api-token --auth-server-url <url>`")
     if settings.auth == "password" and not settings.password:
         if prompt and sys.stdin.isatty():
             password = prompt_password(f"Password for {settings.username or name}@{settings.server_url}")
@@ -171,7 +193,8 @@ def _parse_value(field: str, value: str) -> Any:
 @click.option("--name", "name", default=None, help="Profile name to create or update.")
 @click.option("--server", "server_url", default=None, help="RaaS server URL.")
 @click.option("--username", default=None, help="RaaS username.")
-@click.option("--auth", type=click.Choice(["password", "csp-token"]), default=None)
+@click.option("--auth", type=click.Choice(["password", "csp-token", "api-token"]), default=None)
+@click.option("--auth-server-url", default=None, help="Auth server URL for API-token login (auth=api-token), e.g. https://host:9002.")
 @click.option("--config-name", default=None, help="RaaS authentication configuration name.")
 @click.option("--verify/--no-verify", default=None, help="Verify the RaaS TLS certificate.")
 @click.option("--ca-bundle", type=click.Path(path_type=Path), default=None)
@@ -190,6 +213,7 @@ def configure_command(
     server_url: Optional[str],
     username: Optional[str],
     auth: Optional[str],
+    auth_server_url: Optional[str],
     config_name: Optional[str],
     verify: Optional[bool],
     ca_bundle: Optional[Path],
@@ -232,13 +256,18 @@ def configure_command(
         )
         auth = auth or click.prompt(
             "Authentication",
-            type=click.Choice(["password", "csp-token"]),
+            type=click.Choice(["password", "csp-token", "api-token"]),
             default=existing.auth if existing else "password",
         )
         if auth == "password":
             username = username or click.prompt(
                 "Username",
                 default=(existing.username if existing and existing.username else "root"),
+            )
+        if auth == "api-token":
+            auth_server_url = auth_server_url or click.prompt(
+                "Auth server URL",
+                default=existing.auth_server_url if existing and existing.auth_server_url else "https://auth.example.com:9002",
             )
         config_name = config_name or click.prompt(
             "Authentication config name",
@@ -263,6 +292,7 @@ def configure_command(
         "server_url": server_url,
         "username": username,
         "auth": auth,
+        "auth_server_url": auth_server_url,
         "config_name": config_name,
         "ssl_verify": verify,
         "ca_bundle": str(ca_bundle) if ca_bundle else None,
@@ -276,8 +306,11 @@ def configure_command(
             base[key] = value
     if not base.get("server_url"):
         _fail(ctx, "RaaS server URL is required.", "Pass --server or run interactively.")
-    if base.get("auth", "password") == "password" and not base.get("username"):
+    resolved_auth = base.get("auth", "password")
+    if resolved_auth == "password" and not base.get("username"):
         _fail(ctx, "Username is required for password authentication.")
+    if resolved_auth == "api-token" and not base.get("auth_server_url"):
+        _fail(ctx, "An auth server URL is required for api-token authentication.", "Pass --auth-server-url or run interactively.")
 
     try:
         profile = ConnectionProfile.model_validate(base)
@@ -292,7 +325,7 @@ def configure_command(
         details=[
             ("Server", mask_url(profile.server_url)),
             ("Authentication", profile.auth),
-            ("Username", profile.username or "CSP token"),
+            ("Username", profile.username or "token-based authentication"),
             ("TLS verification", profile.ssl_verify),
             ("Default environment", profile.default_environment),
             ("Default target", profile.default_target),
@@ -533,7 +566,7 @@ def profile_list(ctx: click.Context, as_json: bool) -> None:
             style="scc.success" if item["tls_verify"] else "scc.warning",
         )
         identity = Text()
-        identity.append(item["username"] or "CSP token", style="scc.value")
+        identity.append(item["username"] or "token-based authentication", style="scc.value")
         identity.append(f"\n{item['auth']}", style="scc.hint")
         defaults = Text()
         defaults.append(f"environment: {item['environment']}", style="scc.value")
@@ -576,7 +609,7 @@ def profile_show(ctx: click.Context, name: Optional[str], as_json: bool) -> None
         [
             ("Name", selected),
             ("Server", mask_url(profile.server_url)),
-            ("Username", profile.username or "CSP token"),
+            ("Username", profile.username or "token-based authentication"),
             ("Authentication", profile.auth),
             ("Authentication config", profile.config_name),
             ("TLS verification", profile.ssl_verify),
@@ -606,7 +639,7 @@ def profile_use(ctx: click.Context, name: str) -> None:
     result_summary(
         f"Profile '{name}' is now active",
         message="New SCC commands will use this profile unless --profile or SCC_PROFILE overrides it.",
-        details=[("Server", mask_url(profile.server_url)), ("User", profile.username or "CSP token"), ("Config file", store.path)],
+        details=[("Server", mask_url(profile.server_url)), ("User", profile.username or "token-based authentication"), ("Config file", store.path)],
     )
     next_steps(["Verify: `scc status`", "Temporarily override: `scc --profile <other> status`"])
 
@@ -617,9 +650,9 @@ def profile_use(ctx: click.Context, name: str) -> None:
 @click.option("--password-file", type=click.Path(exists=True, dir_okay=False), default=None)
 @click.pass_context
 def profile_login(ctx: click.Context, name: Optional[str], password_stdin: bool, password_file: Optional[str]) -> None:
-    """Store a profile password or CSP token in the OS keychain."""
+    """Store a profile password or token in the OS keychain."""
     if not keychain_available():
-        _fail(ctx, "No OS keychain backend is available.", "Install/configure keyring, or use SCC_PASSWORD/SCC_CSP_API_TOKEN.")
+        _fail(ctx, "No OS keychain backend is available.", "Install/configure keyring, or use SCC_PASSWORD/SCC_CSP_API_TOKEN/SCC_API_TOKEN.")
     store = _store(ctx)
     try:
         selected, profile = store.get_profile(_profile_name(ctx, name))
@@ -633,7 +666,7 @@ def profile_login(ctx: click.Context, name: Optional[str], password_stdin: bool,
         secret = sys.stdin.read().strip()
         source = "stdin"
     elif sys.stdin.isatty():
-        label = "CSP API token" if profile.auth == "csp-token" else "Password"
+        label = "CSP API token" if profile.auth == "csp-token" else ("API token" if profile.auth == "api-token" else "Password")
         secret = prompt_password(f"{label} for profile '{selected}'")
         source = "interactive prompt"
     else:
@@ -710,6 +743,7 @@ def profile_edit(ctx: click.Context, name: str, test_connection: bool) -> None:
         server_url=None,
         username=None,
         auth=None,
+        auth_server_url=None,
         config_name=None,
         verify=None,
         ca_bundle=None,
@@ -841,7 +875,7 @@ def config_show(ctx: click.Context, name: Optional[str], as_json: bool) -> None:
         _fail(ctx, str(exc))
         return
     data = settings.to_dict(exclude_secrets=True)
-    overrides = [key for key in os.environ if key.startswith("SCC_") and key not in {"SCC_PASSWORD", "SCC_CSP_API_TOKEN"}]
+    overrides = [key for key in os.environ if key.startswith("SCC_") and key not in {"SCC_PASSWORD", "SCC_CSP_API_TOKEN", "SCC_API_TOKEN"}]
     data["environment_overrides"] = sorted(overrides)
     if as_json:
         click.echo(json.dumps(data, indent=2, default=str))
@@ -852,7 +886,7 @@ def config_show(ctx: click.Context, name: Optional[str], as_json: bool) -> None:
         [
             ("Profile", settings.profile_name),
             ("Server", mask_url(settings.server_url)),
-            ("Username", settings.username or "CSP token"),
+            ("Username", settings.username or "token-based authentication"),
             ("Authentication", settings.auth),
             ("TLS verify", settings.ssl_verify),
             ("CA bundle", settings.ca_bundle or "system trust store"),
@@ -921,6 +955,8 @@ def config_env(ctx: click.Context) -> None:
         ("SCC_PROFILE", "Select a profile"), ("SCC_CONFIG", "Use another config file"),
         ("SCC_SERVER_URL", "Override server URL"), ("SCC_USERNAME", "Override username"),
         ("SCC_PASSWORD", "Password for this process"), ("SCC_CSP_API_TOKEN", "CSP token for this process"),
+        ("SCC_API_TOKEN", "API token for this process (auth=api-token)"),
+        ("SCC_AUTH_SERVER_URL", "Auth server URL for API-token login"),
         ("SCC_CONFIG_NAME", "Authentication config name"), ("SCC_SSL_VERIFY", "TLS verification"),
         ("SCC_CA_BUNDLE", "Custom CA bundle"), ("SCC_TIMEOUT", "Request timeout"),
         ("SCC_DEFAULT_ENVIRONMENT", "Default Salt environment"), ("SCC_DEFAULT_TARGET", "Default target"),
@@ -931,7 +967,7 @@ def config_env(ctx: click.Context) -> None:
     for variable, purpose in variables:
         active = variable in os.environ
         value = os.getenv(variable, "")
-        if variable in {"SCC_PASSWORD", "SCC_CSP_API_TOKEN"} and value:
+        if variable in {"SCC_PASSWORD", "SCC_CSP_API_TOKEN", "SCC_API_TOKEN"} and value:
             value = mask(value)
         rows.append([variable, purpose, badge("ACTIVE", "success") if active else badge("NOT SET", "info"), value or "—"])
     data_table("Supported overrides", [("Variable", "scc.strong"), ("Purpose", "scc.value"), ("Status", "scc.value"), ("Value", "scc.hint")], rows, icon="environment")

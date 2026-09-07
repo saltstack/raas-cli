@@ -109,26 +109,28 @@ class TokenCache:
         xsrf_token: Optional[str] = None,
         cookies: Optional[Dict[str, str]] = None,
         csp_access_token: Optional[str] = None,
+        api_token_access_token: Optional[str] = None,
         jwt: Optional[str] = None,
         ttl_seconds: Optional[int] = None
     ) -> None:
         """
         Cache token data.
-        
+
         Args:
             server: RaaS server URL
             username: Username for authentication
             xsrf_token: XSRF token from server
             cookies: HTTP cookies to cache
             csp_access_token: CSP access token (for cloud deployments)
+            api_token_access_token: Access token from the API-token exchange
             jwt: JWT session token from /account/login
             ttl_seconds: Custom TTL (overrides default)
         """
         self._ensure_cache_dir()
-        
+
         cache_key = self._get_cache_key(server, username)
         cache_path = self._get_cache_path(cache_key)
-        
+
         ttl = ttl_seconds or self.ttl_seconds
         data = {
             "server": server,
@@ -136,6 +138,7 @@ class TokenCache:
             "xsrf_token": xsrf_token,
             "cookies": cookies or {},
             "csp_access_token": csp_access_token,
+            "api_token_access_token": api_token_access_token,
             "jwt": jwt,
             "created_at": time.time(),
             "expires_at": time.time() + ttl

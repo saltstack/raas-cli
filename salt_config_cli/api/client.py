@@ -100,6 +100,15 @@ class AriaConfigClient:
     # The login endpoint sits behind the same /raas prefix split as the RPC
     # endpoint on older deployments.
     LOGIN_PATH_CANDIDATES = ("/account/login", "/raas/account/login")
+    # Tenant path segment for the API-token exchange (POST
+    # {auth_server_url}/acs/t/{API_TOKEN_TENANT}/token). Fixed for this
+    # deployment rather than user-configurable.
+    API_TOKEN_TENANT = "CUSTOMER"
+    # RaaS requires this header on RPC calls authenticated with an
+    # api-token-derived Bearer token, or it rejects the request with an
+    # empty-body 401 (observed against a real server; JWT/csp-token sessions
+    # don't appear to need it).
+    RAAS_RPC_VERSION = "13"
 
     def __init__(
         self,
@@ -110,6 +119,8 @@ class AriaConfigClient:
         csp_url: str = "https://console.cloud.vmware.com",
         csp_api_token: Optional[str] = None,
         csp_org_id: Optional[str] = None,
+        auth_server_url: Optional[str] = None,
+        api_token: Optional[str] = None,
         timeout: int = 60,
         ssl_verify: bool = True,
         ssl_cert: Optional[str] = None,
@@ -124,6 +135,10 @@ class AriaConfigClient:
         self.csp_url = csp_url.rstrip("/")
         self.csp_api_token = csp_api_token
         self.csp_org_id = csp_org_id
+        if auth_server_url and not auth_server_url.startswith(("http://", "https://")):
+            auth_server_url = f"https://{auth_server_url}"
+        self.auth_server_url = auth_server_url.rstrip("/") if auth_server_url else None
+        self.api_token = api_token
         self.timeout = timeout
         self.ssl_verify = ssl_verify
         self.ssl_cert = ssl_cert
@@ -136,6 +151,7 @@ class AriaConfigClient:
         self._xsrf_token: Optional[str] = None
         self._jwt: Optional[str] = None
         self._csp_access_token: Optional[str] = None
+        self._api_token_access_token: Optional[str] = None
         self._authenticated = False
         self._riq_counter = 0
 
@@ -210,12 +226,17 @@ class AriaConfigClient:
             "Content-Type": "application/json",
             "Accept": "application/json",
         }
-        if self._xsrf_token:
+        # api-token auth is a stateless Bearer flow - never mix in an XSRF
+        # header/cookie, even if one happens to be set from a prior session.
+        if self._xsrf_token and not self._api_token_access_token:
             headers["X-Xsrftoken"] = self._xsrf_token
         if self._jwt:
             headers["Authorization"] = f"JWT {self._jwt}"
         if self._csp_access_token:
             headers["csp-auth-token"] = self._csp_access_token
+        if self._api_token_access_token:
+            headers["Authorization"] = f"Bearer {self._api_token_access_token}"
+            headers["x-raas-rpc-version"] = self.RAAS_RPC_VERSION
         return headers
 
     def _extract_xsrf_token(self, response: httpx.Response) -> None:
@@ -237,6 +258,25 @@ class AriaConfigClient:
             return False
         head = text.lstrip()[:200].lower()
         return head.startswith("<!doctype") or head.startswith("<html") or "<title" in head
+
+    def _describe_error_response(self, response: httpx.Response, limit: int = 200) -> Optional[str]:
+        """Best-effort detail string for an error response.
+
+        Some servers return an error status with an empty body; in that case
+        fall back to response headers (WWW-Authenticate in particular is the
+        standard way a server hints at the auth scheme/realm it expects) so
+        we're not left debugging blind.
+        """
+        if response.text:
+            return response.text[:limit]
+        www_auth = response.headers.get("WWW-Authenticate")
+        if www_auth:
+            return f"WWW-Authenticate: {www_auth}"
+        skip = {"date", "content-length", "connection", "content-type"}
+        header_dump = "; ".join(f"{k}: {v}" for k, v in response.headers.items() if k.lower() not in skip)
+        if header_dump:
+            return f"(empty body) headers: {header_dump[:limit]}"
+        return None
 
     def _next_rpc_path_candidate(self) -> Optional[str]:
         """Return the next RPC path to try, or None if we've exhausted them."""
@@ -274,14 +314,20 @@ class AriaConfigClient:
         if self._try_cached_auth():
             return
 
-        # 2. Fresh login
-        self._init_xsrf()
+        # 2. Fresh login. API-token auth is a stateless Bearer flow with no
+        # XSRF cookie/header involved (confirmed against a real server), so
+        # skip the XSRF handshake entirely rather than mixing it with a
+        # Bearer token and risking RaaS picking the wrong auth code path.
+        use_api_token = bool(self.api_token and self.auth_server_url)
+        if not use_api_token:
+            self._init_xsrf()
 
-        if self.csp_api_token:
+        if use_api_token:
+            self._authenticate_api_token()
+        elif self.csp_api_token:
             self._authenticate_csp()
-
-        # If we have user/pass, exchange them for a JWT.
-        if self.username and self.password:
+        elif self.username and self.password:
+            # Exchange user/pass for a JWT.
             self._jwt = self._password_login()
             if not self._jwt:
                 raise AuthenticationError(
@@ -289,9 +335,10 @@ class AriaConfigClient:
                     "Check username/password and (if using LDAP) `config_name`.",
                     code=401,
                 )
-        elif not self.csp_api_token:
+        else:
             raise AuthenticationError(
-                "No credentials available. Provide username/password or a CSP API token.",
+                "No credentials available. Provide username/password, a CSP API token, "
+                "or an API token with an auth server URL.",
                 code=401,
             )
 
@@ -313,6 +360,12 @@ class AriaConfigClient:
                     )
                     self.login_path = alt
                     response = self._client.get(f"{self.server}{self.login_path}")
+            # An old-style deployment that needed the /raas/ prefix on the
+            # login path needs it on the RPC path too - applies regardless
+            # of auth mode (password, csp-token, or api-token), since only
+            # _password_login() used to run this check.
+            if self.login_path.startswith("/raas/") and self.rpc_path == self.DEFAULT_RPC_PATH:
+                self.rpc_path = "/raas/rpc"
             self._extract_xsrf_token(response)
         except httpx.RequestError as e:
             raise ConnectionError(f"Cannot reach RaaS server at {self.server}: {e}") from e
@@ -356,17 +409,25 @@ class AriaConfigClient:
 
         self._extract_xsrf_token(response)
 
+        if response.status_code in (404, 405):
+            raise NotFoundError(
+                f"Login endpoint not found at {self.server}{self.login_path} "
+                f"(also tried the fallback path). This server may not expose a "
+                f"SSC/RaaS-style /account/login endpoint at this URL.",
+                code=response.status_code,
+                detail=self._describe_error_response(response),
+            )
         if response.status_code in (401, 403):
             raise AuthenticationError(
                 "Invalid username or password.",
                 code=response.status_code,
-                detail=response.text[:200] if response.text else None,
+                detail=self._describe_error_response(response),
             )
         if response.status_code >= 500:
             raise ServerError(
                 f"RaaS server returned {response.status_code} during login.",
                 code=response.status_code,
-                detail=response.text[:500] if response.text else None,
+                detail=self._describe_error_response(response, limit=500),
             )
 
         text = response.text or ""
@@ -437,9 +498,10 @@ class AriaConfigClient:
         self._jwt = cached.get("jwt")
         self._xsrf_token = cached.get("xsrf_token")
         self._csp_access_token = cached.get("csp_access_token")
+        self._api_token_access_token = cached.get("api_token_access_token")
         for name, value in (cached.get("cookies") or {}).items():
             self._client.cookies.set(name, value)
-        if not self._jwt and not self._csp_access_token:
+        if not self._jwt and not self._csp_access_token and not self._api_token_access_token:
             return False
         try:
             response = self.call("test", "echo", message="scc_cache_probe", _verify=True)
@@ -453,6 +515,7 @@ class AriaConfigClient:
         self._jwt = None
         self._xsrf_token = None
         self._csp_access_token = None
+        self._api_token_access_token = None
         self._client.cookies.clear()
         self._token_cache.delete(self.server, self.username)
         return False
@@ -467,6 +530,7 @@ class AriaConfigClient:
             xsrf_token=self._xsrf_token,
             cookies=cookies,
             csp_access_token=self._csp_access_token,
+            api_token_access_token=self._api_token_access_token,
             jwt=self._jwt,
         )
 
@@ -490,10 +554,44 @@ class AriaConfigClient:
                 raise AuthenticationError(
                     "CSP authentication failed",
                     code=response.status_code,
-                    detail=response.text[:200] if response.text else None,
+                    detail=self._describe_error_response(response),
                 )
         except httpx.RequestError as e:
             raise ConnectionError(f"Failed to connect to CSP: {e}") from e
+
+    # --------------------------------------------------------- API token auth
+
+    def _authenticate_api_token(self) -> None:
+        """Exchange an API token for a Bearer access token via the VCF auth
+        server (POST {auth_server_url}/acs/t/{API_TOKEN_TENANT}/token)."""
+        try:
+            response = self._client.post(
+                f"{self.auth_server_url}/acs/t/{self.API_TOKEN_TENANT}/token",
+                headers={
+                    "Accept": "application/json;charset=UTF-8",
+                    "Content-Type": "application/x-www-form-urlencoded",
+                },
+                data={
+                    "api_token": self.api_token,
+                    "grant_type": "urn:custom:vcf:params:oauth:grant-type:api-token",
+                },
+            )
+            if response.status_code == 200:
+                self._api_token_access_token = response.json().get("access_token")
+                if not self._api_token_access_token:
+                    raise AuthenticationError(
+                        "API token exchange succeeded but no access_token was returned.",
+                        code=response.status_code,
+                        detail=self._describe_error_response(response),
+                    )
+            else:
+                raise AuthenticationError(
+                    "API token exchange failed",
+                    code=response.status_code,
+                    detail=self._describe_error_response(response),
+                )
+        except httpx.RequestError as e:
+            raise ConnectionError(f"Failed to connect to auth server {self.auth_server_url}: {e}") from e
 
     # ------------------------------------------------------------------ RPC
 
@@ -539,11 +637,24 @@ class AriaConfigClient:
 
         # ---- Hard HTTP errors ----
         if response.status_code == 401:
+            if is_verify and not retried:
+                # Some deployments answer a wrong RPC path with 401 rather
+                # than 404/405, so the initial verification probe never gets
+                # a chance to try the other known layout. Try it once here.
+                alt = self._next_rpc_path_candidate()
+                if alt:
+                    log.debug(
+                        "RPC path %s returned 401 during verification; retrying with %s",
+                        self.rpc_path, alt,
+                    )
+                    self.rpc_path = alt
+                    kwargs["_retried"] = True
+                    return self.call(resource, method, *args, **kwargs)
             if is_verify or retried:
                 raise AuthenticationError(
                     "Authentication failed - check username/password",
                     code=401,
-                    detail=response.text[:200] if response.text else None,
+                    detail=self._describe_error_response(response),
                 )
             # Re-auth once, then retry.
             log.debug("Session expired; re-authenticating...")
@@ -565,7 +676,7 @@ class AriaConfigClient:
             raise AuthenticationError(
                 "Access forbidden - insufficient permissions",
                 code=403,
-                detail=response.text[:200] if response.text else None,
+                detail=self._describe_error_response(response),
             )
         if response.status_code in (404, 405) and not retried:
             # Wrong RPC path for this server - try the other known layout once.
@@ -582,26 +693,26 @@ class AriaConfigClient:
             raise NotFoundError(
                 f"RPC endpoint not found: {self.rpc_path}",
                 code=404,
-                detail=response.text[:200] if response.text else None,
+                detail=self._describe_error_response(response),
             )
         if response.status_code == 405:
             raise APIError(
                 f"RPC endpoint rejected POST: {self.rpc_path} (405 Method Not Allowed). "
                 "The server may be using a different RPC path.",
                 code=405,
-                detail=response.text[:200] if response.text else None,
+                detail=self._describe_error_response(response),
             )
         if response.status_code == 422:
             raise ValidationError(
                 "Validation failed",
                 code=422,
-                detail=response.text[:500] if response.text else None,
+                detail=self._describe_error_response(response, limit=500),
             )
         if response.status_code >= 500:
             raise ServerError(
                 f"Server error {response.status_code}",
                 code=response.status_code,
-                detail=response.text[:500] if response.text else None,
+                detail=self._describe_error_response(response, limit=500),
             )
 
         # ---- Body parsing ----

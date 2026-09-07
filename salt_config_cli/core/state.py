@@ -8,7 +8,7 @@ Terraform's state file management.
 import hashlib
 import json
 import os
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 from pydantic import BaseModel, Field
@@ -80,7 +80,7 @@ class StateFile(BaseModel):
     def set_resource(self, resource: ResourceState) -> None:
         """Add or update a resource in state."""
         self.resources[resource.resource_address] = resource
-        self.updated_at = datetime.now(UTC)
+        self.updated_at = datetime.now(timezone.utc)
         self.serial += 1
     
     def remove_resource(self, resource_type: ResourceType, name: str) -> Optional[ResourceState]:
@@ -88,7 +88,7 @@ class StateFile(BaseModel):
         address = f"{resource_type.value}.{name}"
         if address in self.resources:
             removed = self.resources.pop(address)
-            self.updated_at = datetime.now(UTC)
+            self.updated_at = datetime.now(timezone.utc)
             self.serial += 1
             return removed
         return None
@@ -155,8 +155,8 @@ class StateManager:
         import uuid
         return StateFile(
             lineage=str(uuid.uuid4()),
-            created_at=datetime.now(UTC),
-            updated_at=datetime.now(UTC)
+            created_at=datetime.now(timezone.utc),
+            updated_at=datetime.now(timezone.utc)
         )
     
     def save(self) -> None:
@@ -200,7 +200,7 @@ class StateManager:
         try:
             if self._lock_file.exists():
                 # Check if lock is stale
-                lock_age = datetime.now(UTC).timestamp() - self._lock_file.stat().st_mtime
+                lock_age = datetime.now(timezone.utc).timestamp() - self._lock_file.stat().st_mtime
                 if lock_age > self.lock_timeout:
                     self._lock_file.unlink()
                 else:
@@ -209,7 +209,7 @@ class StateManager:
             self._lock_file.parent.mkdir(parents=True, exist_ok=True)
             lock_info = {
                 "pid": os.getpid(),
-                "created": datetime.now(UTC).isoformat(),
+                "created": datetime.now(timezone.utc).isoformat(),
             }
             with open(self._lock_file, "w") as f:
                 json.dump(lock_info, f)

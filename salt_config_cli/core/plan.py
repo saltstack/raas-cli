@@ -8,7 +8,7 @@ Handles the plan/apply workflow similar to Terraform, including:
 """
 
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Dict, List, Optional, Tuple, Union
 from pydantic import BaseModel, Field
@@ -72,7 +72,7 @@ class Plan(BaseModel):
     
     # Plan metadata
     plan_id: str = Field(default="", description="Unique plan identifier")
-    created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     
     # Changes organized by action
     changes: List[ResourceChange] = Field(default_factory=list)
@@ -418,7 +418,7 @@ class PlanExecutor:
                         resource_type=change.resource_type,
                         name=change.name,
                         attributes=change.after or {},
-                        updated_at=datetime.now(UTC),
+                        updated_at=datetime.now(timezone.utc),
                     )
                     resource_state.config_hash = resource_state.compute_hash()
                     self.state_manager.set_resource(resource_state)

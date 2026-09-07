@@ -7,9 +7,14 @@
 #     -t salt-cli-api:latest \
 #     .
 #
-# Run:
+# Run (connects to RaaS and registers the vcf-salt states repo on startup;
+# omit the env vars to skip that and just run the API server):
 #
-#   docker run --rm -p 8000:8000 salt-cli-api:latest
+#   docker run --rm -p 8000:8000 \
+#     -e SCC_SERVER_URL=https://raas.example.com \
+#     -e SCC_USERNAME=admin \
+#     -e SCC_PASSWORD=secret \
+#     salt-cli-api:latest
 #
 # Trigger a command:
 #
@@ -59,5 +64,11 @@ COPY docker/api/requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r /app/requirements.txt
 COPY docker/api/app.py /app/app.py
 
+# 3. Startup configuration: connect to RaaS and register the vcf-salt states repo
+# (skipped automatically if SCC_SERVER_URL/credentials aren't provided at `docker run`)
+COPY docker/entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+
 EXPOSE 8000
+ENTRYPOINT ["/entrypoint.sh"]
 CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]

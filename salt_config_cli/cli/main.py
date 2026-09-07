@@ -234,6 +234,28 @@ def load_settings(
         object.__setattr__(settings, "_password_source", source)
         return settings
 
+    if settings.auth == "api-token":
+        resolved_token = os.getenv("SCC_API_TOKEN")
+        source = "environment" if resolved_token else "none"
+        if not resolved_token:
+            from salt_config_cli.ui import keychain_get
+            resolved_token = keychain_get(settings.server_url, settings.username or "__api_token__")
+            if resolved_token:
+                source = "keychain"
+        if password_file and not resolved_token:
+            resolved_token = Path(password_file).expanduser().read_text(encoding="utf-8").strip()
+            source = f"file:{password_file}"
+        elif password_stdin and not resolved_token:
+            resolved_token = sys.stdin.readline().rstrip("\r\n")
+            source = "stdin"
+        elif password_prompt and not resolved_token:
+            resolved_token = prompt_password("API token")
+            source = "prompt"
+        if resolved_token:
+            settings.api_token = SecretStr(resolved_token)
+        object.__setattr__(settings, "_password_source", source)
+        return settings
+
     if password and _cli_password_provided_on_argv():
         warn_cli_password("--password")
 
@@ -2023,6 +2045,10 @@ def status(ctx, config, server, username, password, password_stdin, password_fil
         credential_value = mask(settings.csp_api_token.get_secret_value() if settings.csp_api_token else None)
         credential_label = "CSP API token"
         identity_value = settings.username or "token-based authentication"
+    elif settings.auth == "api-token":
+        credential_value = mask(settings.api_token.get_secret_value() if settings.api_token else None)
+        credential_label = f"API token ({settings.auth_server_url or 'no auth server configured'})"
+        identity_value = settings.username or "token-based authentication"
     else:
         credential_value = mask(settings.password.get_secret_value() if settings.password else None)
         credential_label = "Password"
@@ -2177,6 +2203,12 @@ def clear_cache(ctx, clear_all, config, server, username, password, password_std
 @click.option("--csp-token", envvar="SCC_CSP_API_TOKEN", default=None,
               metavar="TOKEN",
               help="Use a CSP API token instead of username/password.")
+@click.option("--api-token", envvar="SCC_API_TOKEN", default=None,
+              metavar="TOKEN",
+              help="Use an API token instead of username/password (requires --auth-server-url).")
+@click.option("--auth-server-url", envvar="SCC_AUTH_SERVER_URL", default=None,
+              metavar="URL",
+              help="Auth server URL for --api-token login, e.g. https://host:9002.")
 @click.option("--insecure", is_flag=True, default=False,
               help="Skip TLS certificate verification (saves ssl_verify=false).")
 @click.option("--workspace", is_flag=True, default=False,
@@ -2189,18 +2221,18 @@ def clear_cache(ctx, clear_all, config, server, username, password, password_std
               help="Overwrite an existing connection without prompting.")
 @click.pass_context
 def connect(ctx, profile_name, make_default, server, username, password_prompt, password_stdin, password_file,
-            csp_token, insecure, workspace, skip_test, skip_save_config, force):
+            csp_token, api_token, auth_server_url, insecure, workspace, skip_test, skip_save_config, force):
     """
     Connect to a RaaS server and remember the connection.
 
-    Interactive one-shot setup: asks for server URL, username, and password
-    (masked), tests the connection, then persists everything so subsequent
-    commands work without any flags.
+    Interactive one-shot setup: asks for server URL and an authentication
+    method (basic username/password, or an API token), tests the connection,
+    then persists everything so subsequent commands work without any flags.
 
     \b
     What gets stored:
       • Named profile settings → config file (~/.scc/config.yaml by default)
-      • Password               →  OS keychain (Keychain / Secret Service / Credential Manager)
+      • Password/token         →  OS keychain (Keychain / Secret Service / Credential Manager)
 
     \b
     Examples:
@@ -2210,6 +2242,7 @@ def connect(ctx, profile_name, make_default, server, username, password_prompt, 
       $ scc connect -s https://10.0.0.1 -u root --password-file ~/.scc/password
       $ echo "$PW" | scc connect -s ... -u root --password-stdin   # piped (CI/scripts)
       $ scc connect --csp-token "$CSP"                             # CSP token instead
+      $ scc connect --api-token "$TOKEN" --auth-server-url https://10.0.0.1:9002  # API token instead
       $ scc connect -s ... -u root --insecure                      # skip TLS verify
       $ scc connect --workspace                                    # save in ./.scc/config.yaml
       $ scc connect --no-test                                      # skip the live probe
@@ -2223,7 +2256,7 @@ def connect(ctx, profile_name, make_default, server, username, password_prompt, 
     command_header(
         "connect",
         "Connect to a RaaS server",
-        description="Enter the RaaS server URL, username, and password. Nothing is sent anywhere until you confirm.",
+        description="Enter the RaaS server URL and authentication details. Nothing is sent anywhere until you confirm.",
         icon="plug",
     )
 
@@ -2271,8 +2304,50 @@ def connect(ctx, profile_name, make_default, server, username, password_prompt, 
         server = "https://" + server
     server = server.rstrip("/")
 
-    # ---- Username (skipped when using a CSP token) ----
-    if not csp_token:
+    # ---- Authentication method (basic username/password vs. API token) ----
+    use_api_token = bool(api_token or auth_server_url)
+    if not csp_token and not use_api_token and not username and tty_in:
+        auth_method = click.prompt(
+            "Authentication method",
+            type=click.Choice(["basic", "token"]),
+            default="basic",
+            show_default=True,
+        )
+        if auth_method == "token":
+            use_api_token = True
+
+    if use_api_token:
+        if not auth_server_url:
+            if tty_in:
+                try:
+                    auth_server_url = click.prompt("Auth server URL", type=str).strip()
+                except click.exceptions.Abort:
+                    console.print("\n[yellow]Aborted by user.[/yellow]\n")
+                    sys.exit(1)
+            else:
+                ui_error("--auth-server-url is required when using an API token in non-interactive mode.")
+                sys.exit(2)
+        if not auth_server_url:
+            ui_error("Auth server URL is required.")
+            sys.exit(2)
+        if not auth_server_url.startswith(("http://", "https://")):
+            auth_server_url = "https://" + auth_server_url
+        auth_server_url = auth_server_url.rstrip("/")
+        if not api_token:
+            if tty_in:
+                api_token = prompt_password("API token")
+            else:
+                ui_error(
+                    "--api-token is required when using an API token in non-interactive mode.",
+                    hint="Pass --api-token or set SCC_API_TOKEN.",
+                )
+                sys.exit(2)
+        if not api_token:
+            ui_error("Empty API token; aborting.")
+            sys.exit(1)
+
+    # ---- Username (skipped when using a CSP token or an API token) ----
+    if not csp_token and not use_api_token:
         if not username:
             if tty_in:
                 try:
@@ -2309,7 +2384,12 @@ def connect(ctx, profile_name, make_default, server, username, password_prompt, 
             f"    [dim]server:[/dim]   [cyan]{existing_settings.server_url}[/cyan]\n"
             f"    [dim]username:[/dim] [cyan]{existing_settings.username}[/cyan]\n"
         )
-        target = f"{username}@{server}" if username else f"CSP token @ {server}"
+        if username:
+            target = f"{username}@{server}"
+        elif use_api_token:
+            target = f"API token @ {server}"
+        else:
+            target = f"CSP token @ {server}"
         if not click.confirm(f"Replace it with {target}?", default=True):
             console.print("[yellow]Aborted. Existing connection kept.[/yellow]\n")
             sys.exit(1)
@@ -2317,17 +2397,22 @@ def connect(ctx, profile_name, make_default, server, username, password_prompt, 
     # ---- Password resolution ----
     # Resolution order:
     #   1. CSP token (skip password entirely)
-    #   2. --password-file
-    #   3. --password-stdin   (only if stdin is *actually* piped; falls back to prompt)
-    #   4. --password-prompt  (or any other path that lands us in interactive mode)
-    #   5. Existing keychain entry  (offer to reuse it)
-    #   6. Default: prompt when running on a TTY
+    #   2. API token (skip password entirely)
+    #   3. --password-file
+    #   4. --password-stdin   (only if stdin is *actually* piped; falls back to prompt)
+    #   5. --password-prompt  (or any other path that lands us in interactive mode)
+    #   6. Existing keychain entry  (offer to reuse it)
+    #   7. Default: prompt when running on a TTY
     pw: str = ""
     pw_source: str = ""
 
     if csp_token:
         pw_source = "csp-token"
         # Nothing to do; the probe will use the CSP token.
+
+    elif use_api_token:
+        pw_source = "api-token"
+        # Nothing to do; the probe will use the API token.
 
     elif password_file:
         try:
@@ -2398,7 +2483,7 @@ def connect(ctx, profile_name, make_default, server, username, password_prompt, 
             pw = prompt_password(f"Password for {username}@{server}")
             pw_source = "prompt"
 
-    if not csp_token and not pw:
+    if not csp_token and not use_api_token and not pw:
         ui_error("Empty password; aborting.")
         sys.exit(1)
 
@@ -2413,6 +2498,9 @@ def connect(ctx, profile_name, make_default, server, username, password_prompt, 
             probe_settings.password = SecretStr(pw)
         if csp_token:
             probe_settings.csp_api_token = SecretStr(csp_token)
+        if use_api_token:
+            probe_settings.auth_server_url = auth_server_url
+            probe_settings.api_token = SecretStr(api_token)
         if insecure:
             probe_settings.ssl_verify = False
         object.__setattr__(probe_settings, "_password_source", pw_source)
@@ -2441,10 +2529,16 @@ def connect(ctx, profile_name, make_default, server, username, password_prompt, 
 
     # ---- Persist the credential to the OS keychain ----
     keychain_ok = False
-    credential_identity = username or "__csp__"
+    if use_api_token:
+        credential_identity = username or "__api_token__"
+    else:
+        credential_identity = username or "__csp__"
     if csp_token and keychain_available():
         keychain_ok = keychain_set(server, credential_identity, csp_token)
         pw_source = "csp-token"
+    elif use_api_token and keychain_available():
+        keychain_ok = keychain_set(server, credential_identity, api_token)
+        pw_source = "api-token"
     elif pw_source == "keychain":
         # Already stored — nothing to do, but report it correctly.
         keychain_ok = True
@@ -2469,11 +2563,18 @@ def connect(ctx, profile_name, make_default, server, username, password_prompt, 
                 current = store.load().profiles.get(selected_profile)
             except Exception:
                 current = None
+            if csp_token:
+                resolved_auth = "csp-token"
+            elif use_api_token:
+                resolved_auth = "api-token"
+            else:
+                resolved_auth = "password"
             profile_data = current.model_dump() if current else {}
             profile_data.update({
                 "server_url": server,
                 "username": username or None,
-                "auth": "csp-token" if csp_token else "password",
+                "auth": resolved_auth,
+                "auth_server_url": auth_server_url if use_api_token else None,
                 "ssl_verify": not insecure,
             })
             profile = ConnectionProfile.model_validate(profile_data)
@@ -2485,24 +2586,36 @@ def connect(ctx, profile_name, make_default, server, username, password_prompt, 
     # ---- Summary ----
     if csp_token:
         password_cell = "OS keychain (secure)" if keychain_ok else "CSP token (runtime only)"
+    elif use_api_token:
+        password_cell = "OS keychain (secure)" if keychain_ok else "API token (runtime only)"
     elif keychain_ok:
         password_cell = "OS keychain (secure)"
     else:
         password_cell = "[yellow]not stored[/yellow]"
 
+    if username:
+        username_cell = username
+    elif use_api_token:
+        username_cell = "[dim](using API token)[/dim]"
+    else:
+        username_cell = "[dim](using CSP token)[/dim]"
+
     kv_rows = {
         "Profile": selected_profile,
         "Server": server,
-        "Username": username or "[dim](using CSP token)[/dim]",
+        "Username": username_cell,
         "Password": password_cell,
         "Source": {
             "csp-token": "CSP token",
+            "api-token": "API token",
             "prompt": "interactive prompt",
             "stdin": "stdin (piped)",
             "keychain": "OS keychain (reused)",
         }.get(pw_source, pw_source or "—"),
         "SSL verify": "[yellow]disabled[/yellow]" if insecure else "enabled",
     }
+    if use_api_token:
+        kv_rows["Auth server"] = mask_url(auth_server_url)
     if cfg_path:
         kv_rows["Config file"] = str(cfg_path)
     kv_table(f"{ICONS['shield']} Connection saved", kv_rows)
@@ -2545,7 +2658,7 @@ def disconnect(ctx, purge, clear_all, assume_yes):
     settings = SaltConfigSettings.load_from_file(_GLOBAL_CONFIG_PATH, _ACTIVE_PROFILE_OVERRIDE)
     srv = settings.server_url
     user = settings.username
-    credential_identity = user or "__csp__"
+    credential_identity = user or ("__api_token__" if settings.auth == "api-token" else "__csp__")
 
     if not srv or srv == "https://localhost" or (settings.auth == "password" and not user):
         ui_warn("No active connection to disconnect.",
