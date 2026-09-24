@@ -409,6 +409,14 @@ curl --request POST \
   --data grant_type=urn:custom:vcf:params:oauth:grant-type:api-token
 ```
 
+#### Generating the API token from VCF Operations
+
+1. **Configure SSO in VCF Operations.** Prerequisites: VCF Ops Admin credentials. Navigate to **Manage → Identity & Access** and configure Single Sign-On (SSO) using either an Embedded or External VIDB.
+2. **Join Salt RaaS to VCF SSO.** Open **VCF SSO Overview** under **VCF Management**. Locate the Salt RaaS component, click **Join VCF SSO**, and complete the integration.
+3. **Create the API client.** From **VCF SSO Overview**, click your newly configured VCF SSO instance. Navigate to the **API Access** tab, create a new API client assigned the **VCF Administrator** role, and save your changes.
+4. **Generate the API token.** Select the newly created API client and generate the API token. Securely save both the API token and the token endpoint URL.
+5. **Configure the raas-cli tool.** Launch the raas-cli tool and input the generated API token alongside the endpoint URL (the `auth_server_url` below) to finalize the connection.
+
 Configure it with:
 
 ```bash
